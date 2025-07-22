@@ -1,0 +1,415 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import vlc
+import os
+import json
+from mutagen import File
+import threading
+import time
+import speech_recognition as sr
+import yt_dlp
+
+class MusicPlayer:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Music Player")
+        self.root.geometry("800x600")
+        self.root.configure(bg='#2c3e50')
+
+        # Initialize VLC player
+        self.vlc_instance = vlc.Instance()
+        self.player = self.vlc_instance.media_player_new()
+
+        # Initialize speech recognition
+        self.recognizer = sr.Recognizer()
+        try:
+            self.microphone = sr.Microphone()
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+        except Exception:
+            self.microphone = None  # Handle no microphone case
+
+        # Player state variables
+        self.is_playing = False
+        self.is_paused = False
+        self.is_seeking = False
+        self.is_playing_online = False  # Distinguish between local and online
+        self.volume = 70
+        self.playlist = []
+        self.current_index = 0
+        self.current_song_details = {}
+
+        self.load_playlist()
+        self.create_widgets()
+
+        # Start position updater thread
+        self.position_thread = threading.Thread(target=self.update_position, daemon=True)
+        self.position_thread.start()
+
+    def create_widgets(self):
+        # Main frame
+        main_frame = tk.Frame(self.root, bg='#2c3e50')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Title
+        title_label = tk.Label(main_frame, text="Music Player", font=('Arial', 20, 'bold'), fg='#ecf0f1', bg='#2c3e50')
+        title_label.pack(pady=(0, 20))
+
+        # Current song info frame
+        info_frame = tk.Frame(main_frame, bg='#34495e', relief=tk.RAISED, bd=2)
+        info_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.song_info_label = tk.Label(info_frame, text="No song selected", font=('Arial', 12), fg='#ecf0f1', bg='#34495e')
+        self.song_info_label.pack(pady=10)
+
+        # AI Search Frame
+        ai_frame = tk.Frame(main_frame, bg='#34495e', relief=tk.RAISED, bd=2)
+        ai_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ai_title = tk.Label(ai_frame, text="🎵 AI Song Search", font=('Arial', 14, 'bold'), fg='#e67e22', bg='#34495e')
+        ai_title.pack(pady=(10, 5))
+
+        search_input_frame = tk.Frame(ai_frame, bg='#34495e')
+        search_input_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.search_entry = tk.Entry(search_input_frame, font=('Arial', 12), bg='#2c3e50', fg='#ecf0f1', insertbackground='#ecf0f1')
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.search_entry.bind('<Return>', self.search_song_text)
+        # **FIX**: Bind key release to check if search bar is empty
+        self.search_entry.bind('<KeyRelease>', self.check_search_entry)
+
+        search_btn_frame = tk.Frame(ai_frame, bg='#34495e')
+        search_btn_frame.pack(pady=5)
+
+        self.search_btn = tk.Button(search_btn_frame, text="🔍 Search", bg='#3498db', fg='white', command=self.search_song_text, relief=tk.RAISED, bd=2, font=('Arial', 10))
+        self.search_btn.pack(side=tk.LEFT, padx=5)
+
+        self.voice_btn = tk.Button(search_btn_frame, text="🎤 Voice Search", bg='#e74c3c', fg='white', command=self.voice_search, relief=tk.RAISED, bd=2, font=('Arial', 10))
+        self.voice_btn.pack(side=tk.LEFT, padx=5)
+
+        self.search_results_frame = tk.Frame(ai_frame, bg='#34495e')
+        
+        # Progress frame
+        progress_frame = tk.Frame(main_frame, bg='#2c3e50')
+        progress_frame.pack(fill=tk.X, pady=(0, 10))
+        self.time_label = tk.Label(progress_frame, text="00:00 / 00:00", font=('Arial', 10), fg='#ecf0f1', bg='#2c3e50')
+        self.time_label.pack()
+        self.progress_var = tk.DoubleVar()
+        self.progress_scale = ttk.Scale(progress_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.progress_var)
+        self.progress_scale.pack(fill=tk.X, pady=5)
+        self.progress_scale.bind('<Button-1>', self.on_seek_start)
+        self.progress_scale.bind('<ButtonRelease-1>', self.on_seek_end)
+
+        # Control buttons frame
+        control_frame = tk.Frame(main_frame, bg='#2c3e50')
+        control_frame.pack(pady=10)
+        self.prev_btn = tk.Button(control_frame, text="⏮", font=('Arial', 16), bg='#3498db', fg='white', command=self.previous_song, width=3, relief=tk.RAISED, bd=2)
+        self.prev_btn.pack(side=tk.LEFT, padx=5)
+        self.play_btn = tk.Button(control_frame, text="▶", font=('Arial', 16), bg='#27ae60', fg='white', command=self.toggle_play, width=3, relief=tk.RAISED, bd=2)
+        self.play_btn.pack(side=tk.LEFT, padx=5)
+        self.next_btn = tk.Button(control_frame, text="⏭", font=('Arial', 16), bg='#3498db', fg='white', command=self.next_song, width=3, relief=tk.RAISED, bd=2)
+        self.next_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn = tk.Button(control_frame, text="⏹", font=('Arial', 16), bg='#e74c3c', fg='white', command=self.stop_song, width=3, relief=tk.RAISED, bd=2)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+
+        # Playlist frame
+        playlist_frame = tk.Frame(main_frame, bg='#2c3e50')
+        playlist_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        # Playlist buttons
+        playlist_btn_frame = tk.Frame(playlist_frame, bg='#2c3e50')
+        playlist_btn_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.add_btn = tk.Button(playlist_btn_frame, text="Add Songs", bg='#9b59b6', fg='white', command=self.add_songs, relief=tk.RAISED, bd=2)
+        self.add_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.remove_btn = tk.Button(playlist_btn_frame, text="Remove Song", bg='#e67e22', fg='white', command=self.remove_song, relief=tk.RAISED, bd=2)
+        self.remove_btn.pack(side=tk.LEFT, padx=5)
+
+        # Playlist listbox
+        listbox_frame = tk.Frame(playlist_frame, bg='#2c3e50')
+        listbox_frame.pack(fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(listbox_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.playlist_listbox = tk.Listbox(listbox_frame, yscrollcommand=scrollbar.set, bg='#34495e', fg='#ecf0f1', selectbackground='#3498db', font=('Arial', 10))
+        self.playlist_listbox.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.playlist_listbox.yview)
+        self.playlist_listbox.bind('<Double-1>', self.play_selected_song)
+        self.update_playlist_display()
+
+    def add_songs(self):
+        files = filedialog.askopenfilenames(
+            title="Select Music Files",
+            filetypes=[("Audio Files", "*.mp3 *.wav *.ogg *.flac *.m4a")]
+        )
+        for file in files:
+            if file not in self.playlist:
+                self.playlist.append(file)
+        self.update_playlist_display()
+        self.save_playlist()
+
+    def remove_song(self):
+        """
+        Removes the selected song from the local playlist.
+        """
+        selection = self.playlist_listbox.curselection()
+        if not selection:
+            return
+
+        index_to_remove = selection[0]
+        
+        # Check if the song to be removed is the one currently playing
+        is_currently_playing_song = (self.is_playing and 
+                                     not self.is_playing_online and 
+                                     self.current_index == index_to_remove)
+
+        # Delete from the Python list first
+        del self.playlist[index_to_remove]
+        
+        if is_currently_playing_song:
+            # If it was the playing song, stop everything
+            self.stop_song()
+        else:
+            # If a different song was playing, just update the index if needed
+            if self.current_index > index_to_remove:
+                self.current_index -= 1
+            # Refresh the display to reflect the removal
+            self.update_playlist_display()
+
+        self.save_playlist()
+
+    def play_selected_song(self, event=None):
+        if not self.playlist_listbox.curselection(): return
+        self.current_index = self.playlist_listbox.curselection()[0]
+        self.play_song()
+
+    def play_song(self):
+        if not self.playlist or self.current_index >= len(self.playlist): return
+        
+        self.is_playing_online = False
+        song_path = self.playlist[self.current_index]
+        media = self.vlc_instance.media_new(song_path)
+        self.player.set_media(media)
+        self.player.play()
+        self.is_playing = True
+        self.is_paused = False
+        self.play_btn.config(text="⏸")
+        self.get_song_info()
+        self.update_playlist_display()
+
+    def toggle_play(self):
+        if self.is_playing:
+            self.player.pause()
+            self.is_paused = not self.is_paused
+            self.play_btn.config(text="▶" if self.is_paused else "⏸")
+        elif self.playlist:
+            self.play_song()
+        else:
+            messagebox.showwarning("Empty Playlist", "Please add songs to the playlist first.")
+
+    def stop_song(self):
+        self.player.stop()
+        self.is_playing = False
+        self.is_paused = False
+        self.is_playing_online = False
+        self.play_btn.config(text="▶")
+        self.song_info_label.config(text="No song selected")
+        self.time_label.config(text="00:00 / 00:00")
+        self.progress_var.set(0)
+        # **FIX**: Update the playlist display to remove the playing indicator
+        self.update_playlist_display()
+
+    def next_song(self):
+        if not self.playlist or self.is_playing_online: return
+        self.current_index = (self.current_index + 1) % len(self.playlist)
+        self.play_song()
+
+    def previous_song(self):
+        if not self.playlist or self.is_playing_online: return
+        self.current_index = (self.current_index - 1) % len(self.playlist)
+        self.play_song()
+
+    def on_seek_start(self, event):
+        self.is_seeking = True
+
+    def on_seek_end(self, event):
+        if self.is_playing:
+            position = self.progress_var.get() / 100.0
+            self.player.set_position(position)
+        self.is_seeking = False
+    
+    def search_song_text(self, event=None):
+        query = self.search_entry.get().strip()
+        if not query:
+            messagebox.showwarning("Empty Search", "Please enter a song name.")
+            return
+        threading.Thread(target=self.perform_search, args=(query,), daemon=True).start()
+    
+    def voice_search(self):
+        if not self.microphone:
+            messagebox.showerror("Error", "Microphone not found.")
+            return
+        
+        self.voice_btn.config(text="🎤 Listening...", state='disabled')
+        self.root.update()
+        
+        try:
+            with self.microphone as source:
+                audio = self.recognizer.listen(source, timeout=5)
+            query = self.recognizer.recognize_google(audio)
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.insert(0, query)
+            self.perform_search(query)
+        except Exception as e:
+            messagebox.showerror("Voice Error", f"Could not process voice input: {e}")
+        finally:
+            self.voice_btn.config(text="🎤 Voice Search", state='normal')
+
+    def perform_search(self, query):
+        self.root.after(0, lambda: self.search_btn.config(text="🔍 Searching...", state='disabled'))
+        try:
+            results = self.search_online(query)
+            self.root.after(0, lambda: self.display_search_results(results))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Search Error", str(e)))
+        finally:
+            self.root.after(0, lambda: self.search_btn.config(text="🔍 Search", state='normal'))
+
+    def search_online(self, query):
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'default_search': 'ytsearch5',
+            'quiet': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            search_result = ydl.extract_info(query, download=False)
+            video_entries = search_result.get('entries', [])
+            
+            results = []
+            for item in video_entries:
+                results.append({
+                    'title': item.get('title', 'Unknown Title'),
+                    'artist': item.get('channel', 'Unknown Artist'),
+                    'stream_url': item.get('url'),
+                    'source': 'YouTube'
+                })
+            return results
+
+    def display_search_results(self, results):
+        self.hide_search_results() # Clear previous results
+        
+        if not results:
+            tk.Label(self.search_results_frame, text="No results found", font=('Arial', 10), fg='#e74c3c', bg='#34495e').pack()
+        else:
+            for result in results:
+                result_frame = tk.Frame(self.search_results_frame, bg='#2c3e50')
+                result_frame.pack(fill=tk.X, pady=2)
+                
+                info_text = f"{result['title']} - {result['artist']}"
+                tk.Label(result_frame, text=info_text, fg='#ecf0f1', bg='#2c3e50', anchor='w').pack(side=tk.LEFT, fill=tk.X, expand=True)
+                
+                play_btn = tk.Button(result_frame, text="🎵 Play", bg='#27ae60', fg='white', command=lambda r=result: self.play_online_song(r))
+                play_btn.pack(side=tk.RIGHT)
+            
+        self.search_results_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    def hide_search_results(self):
+        """Clears and hides the search results frame."""
+        for widget in self.search_results_frame.winfo_children():
+            widget.destroy()
+        self.search_results_frame.pack_forget()
+
+    def check_search_entry(self, event=None):
+        """Checks the search entry and hides results if it's empty."""
+        if not self.search_entry.get():
+            self.hide_search_results()
+
+    def play_online_song(self, result):
+        self.stop_song()
+        self.is_playing_online = True
+        self.playlist_listbox.selection_clear(0, tk.END)
+
+        stream_url = result.get('stream_url')
+        if not stream_url:
+            messagebox.showerror("Error", "Could not find a playable stream for this song.")
+            return
+
+        self.song_info_label.config(text=f"{result['title']} (Online)")
+        
+        media = self.vlc_instance.media_new(stream_url)
+        self.player.set_media(media)
+        self.player.play()
+        self.is_playing = True
+        self.is_paused = False
+        self.play_btn.config(text="⏸")
+
+    def get_song_info(self):
+        if self.is_playing_online or not self.playlist: return
+        song_path = self.playlist[self.current_index]
+        try:
+            audio = File(song_path)
+            title = audio.get('TIT2', [os.path.basename(song_path)])[0]
+            artist = audio.get('TPE1', ['Unknown Artist'])[0]
+            self.song_info_label.config(text=f"{title} - {artist}")
+        except Exception:
+            self.song_info_label.config(text=os.path.basename(song_path))
+    
+    def update_position(self):
+        while True:
+            if self.is_playing and not self.is_paused and not self.is_seeking:
+                length_ms = self.player.get_length()
+                pos_ms = self.player.get_time()
+
+                if length_ms > 0:
+                    progress = (pos_ms / length_ms) * 100
+                    self.progress_var.set(progress)
+                    
+                    current_time_str = time.strftime('%M:%S', time.gmtime(pos_ms / 1000))
+                    total_time_str = time.strftime('%M:%S', time.gmtime(length_ms / 1000))
+                    self.time_label.config(text=f"{current_time_str} / {total_time_str}")
+                
+                if self.player.get_state() == vlc.State.Ended:
+                    if not self.is_playing_online:
+                        self.root.after(100, self.next_song)
+                    else:
+                        self.root.after(100, self.stop_song)
+
+            time.sleep(0.5)
+
+    def update_playlist_display(self):
+        self.playlist_listbox.delete(0, tk.END)
+        for i, song in enumerate(self.playlist):
+            song_name = os.path.basename(song)
+            if i == self.current_index and not self.is_playing_online and self.is_playing:
+                self.playlist_listbox.insert(tk.END, f"♪ {song_name}")
+                self.playlist_listbox.itemconfig(i, {'bg':'#3498db', 'fg': 'white'})
+            else:
+                self.playlist_listbox.insert(tk.END, song_name)
+
+    def save_playlist(self):
+        try:
+            with open('playlist.json', 'w') as f:
+                json.dump(self.playlist, f)
+        except Exception as e:
+            print(f"Error saving playlist: {e}")
+
+    def load_playlist(self):
+        if os.path.exists('playlist.json'):
+            try:
+                with open('playlist.json', 'r') as f:
+                    self.playlist = json.load(f)
+            except Exception as e:
+                print(f"Error loading playlist: {e}")
+                self.playlist = []
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MusicPlayer(root)
+    
+    def on_closing():
+        app.save_playlist()
+        root.destroy()
+        
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
